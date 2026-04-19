@@ -68,16 +68,36 @@ fn mmio_clr_bits32(addr: usize, bits: u32) {
 
 /// SDIO1 硬件初始化所需的 SoC 子系统基址
 pub struct Sdio1HwConfig {
-    /// CRG (Clock/Reset Generator) 基址  
+    /// CRG (Clock/Reset Generator) 虚拟地址
     pub crg_base_va: usize,
-    /// System Control (TOP_MISC) 基址  
+    /// System Control (TOP_MISC) 虚拟地址
     pub sysctrl_base_va: usize,
-    /// RTC 子系统控制寄存器基址  
+    /// RTC 子系统控制寄存器虚拟地址
     pub rtcsys_ctrl_base_va: usize,
-    /// RTC 子系统 IO 复用寄存器基址  
+    /// RTC 子系统 IO 复用寄存器虚拟地址
     pub rtcsys_io_base_va: usize,
-    /// SDIO1 控制器基址
+    /// SDIO1 控制器虚拟地址
     pub sdio1_base_va: usize,
+}
+
+impl Sdio1HwConfig {
+    /// 从平台物理地址和 phys-virt offset 构造虚拟地址
+    pub fn new(
+        crg_paddr: usize,
+        sysctrl_paddr: usize,
+        rtcsys_ctrl_paddr: usize,
+        rtcsys_io_paddr: usize,
+        sdio1_paddr: usize,
+        phys_virt_offset: usize,
+    ) -> Self {
+        Self {
+            crg_base_va:         crg_paddr + phys_virt_offset,
+            sysctrl_base_va:     sysctrl_paddr + phys_virt_offset,
+            rtcsys_ctrl_base_va: rtcsys_ctrl_paddr + phys_virt_offset,
+            rtcsys_io_base_va:   rtcsys_io_paddr + phys_virt_offset,
+            sdio1_base_va:       sdio1_paddr + phys_virt_offset,
+        }
+    }
 }
 
 /// SDIO1 SoC 级硬件使能: Pinmux → 时钟 → 复位 → 卡检测覆写  

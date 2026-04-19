@@ -114,29 +114,29 @@ pub const HC_HIGH_SPEED: u8 = 0x04; // bit 2: High Speed Enable
 pub const HC_CARD_DET_TEST: u8 = 0x40; // bit 6: Card Detect Test Level
 pub const HC_CARD_DET_SEL: u8 = 0x80; // bit 7: Card Detect Signal Selection
 
-/// Command Register (0x0E) 位定义 (16-bit)    
-/// 命令索引左移位数（bits[13:8]）  
+/// Command Register (0x0E) 位定义 (16-bit)
+/// 命令索引左移位数（bits[13:8]）
 pub const CMD_INDEX_SHIFT: u32 = 8;
 
 // ---- Response Type Select (bits[1:0]) ----
-pub const CMD_RESP_NONE: u16 = 0x00; // 00: 无响应  
-pub const CMD_RESP_136: u16 = 0x01; // 01: 136-bit 响应 (R2)  
-pub const CMD_RESP_48: u16 = 0x02; // 10: 48-bit 响应  
-pub const CMD_RESP_48_BUSY: u16 = 0x03; // 11: 48-bit 响应 + busy  
+pub const CMD_RESP_NONE: u16 = 0x00; // 00: 无响应
+pub const CMD_RESP_136: u16 = 0x01; // 01: 136-bit 响应 (R2)
+pub const CMD_RESP_48: u16 = 0x02; // 10: 48-bit 响应
+pub const CMD_RESP_48_BUSY: u16 = 0x03; // 11: 48-bit 响应 + busy
 
 // ---- 控制位 ----
-pub const CMD_CRC_CHECK_EN: u16 = 1 << 3; // bit 3: CRC 校验使能  
-pub const CMD_INDEX_CHECK_EN: u16 = 1 << 4; // bit 4: 索引校验使能  
-pub const CMD_DATA_PRESENT: u16 = 1 << 5; // bit 5: 有数据传输  
+pub const CMD_CRC_CHECK_EN: u16 = 1 << 3; // bit 3: CRC 校验使能
+pub const CMD_INDEX_CHECK_EN: u16 = 1 << 4; // bit 4: 索引校验使能
+pub const CMD_DATA_PRESENT: u16 = 1 << 5; // bit 5: 有数据传输
 
 // ---- 组合标志（按 SD/SDIO 响应类型）----
-/// R4: 48-bit, 无 CRC/索引校验 (CMD5)  
+/// R4: 48-bit, 无 CRC/索引校验 (CMD5)
 pub const CMD_FLAGS_R4: u16 = CMD_RESP_48;
-/// R5/R6: 48-bit + CRC + 索引校验 (CMD3, CMD52)  
+/// R5/R6: 48-bit + CRC + 索引校验 (CMD3, CMD52)
 pub const CMD_FLAGS_R5: u16 = CMD_RESP_48 | CMD_CRC_CHECK_EN | CMD_INDEX_CHECK_EN;
-/// R1b: 48-bit busy + CRC + 索引校验 (CMD7)  
+/// R1b: 48-bit busy + CRC + 索引校验 (CMD7)
 pub const CMD_FLAGS_R1B: u16 = CMD_RESP_48_BUSY | CMD_CRC_CHECK_EN | CMD_INDEX_CHECK_EN;
-/// R5 + 数据: 48-bit + CRC + 索引 + data present (CMD53)  
+/// R5 + 数据: 48-bit + CRC + 索引 + data present (CMD53)
 pub const CMD_FLAGS_R5_DATA: u16 = CMD_FLAGS_R5 | CMD_DATA_PRESENT;
 
 /// 时钟频率常量 (Hz)

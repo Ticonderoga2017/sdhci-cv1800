@@ -13,17 +13,17 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod hw_init;
 pub mod irq;
 pub mod regs;
 
-use crate::{irq::mask_card_irq_raw, regs::*};
-use axdriver_sdio::{SdioHost, cccr::*, cmd::*, error::SdioError};
-use axtask::future::block_on;
+use alloc::sync::Arc;
+use crate::regs::*;
+use axdriver_sdio::{SdioCardIrq, SdioHost, cccr::*, cmd::*, error::SdioError};
 use core::{
-    future::poll_fn,
     ptr::{read_volatile, write_volatile},
-    task::Poll,
 };
 
 pub(crate) fn mmio_read<T: Copy>(addr: usize) -> T {
@@ -32,6 +32,26 @@ pub(crate) fn mmio_read<T: Copy>(addr: usize) -> T {
 
 pub(crate) fn mmio_write<T: Copy>(addr: usize, val: T) {
     unsafe { write_volatile(addr as *mut T, val) }
+}
+
+pub struct CviCardIrqCtrl {
+    base: usize,
+}
+
+impl CviCardIrqCtrl {
+    pub fn new(base: usize) ->Self {
+        Self { base }
+    }
+}
+
+impl SdioCardIrq for CviCardIrqCtrl {
+    fn mask_card_irq(&self) {
+        irq::mask_card_irq_raw(self.base, true);
+    }
+
+    fn unmask_card_irq(&self) {
+        irq::mask_card_irq_raw(self.base, false);
+    }
 }
 
 /// CVI SoC WiFi SDIO 控制器  
@@ -59,7 +79,7 @@ impl CviSdhci {
     #[inline(always)]
     fn write<T: Copy>(&self, off: u32, val: T) {
         mmio_write::<T>(self.base + off as usize, val)
-    }
+    }    
 
     /// 中断驱动等待（零 spin，任务睡眠，ISR 唤醒）
     fn classify_error(err: u16) -> SdioError {
@@ -82,18 +102,31 @@ impl CviSdhci {
         None
     }
 
-    /// 等待：check → register waker → recheck → sleep  
     fn wait_irq_flag(&self, take: fn() -> bool) -> Result<(), SdioError> {
-        block_on(poll_fn(|cx| {
+        for _ in 0..1000 {
             if let Some(r) = self.try_take(take) {
-                return Poll::Ready(r);
+                return r;
             }
-            irq::register_sdhci_waker(cx.waker());
+            core::hint::spin_loop();
+        }
+        // Slow path: yield loop (NOT block_on)
+        //
+        // Using block_on here creates nested block_on when called from
+        // within TX/RX thread's own block_on loop. Two AxWakers for the
+        // same task with separate woke flags cause a race: ISR fires between
+        // blocked_resched dropping the SpinNoIrq guard and changing task
+        // state, consuming the wake but leaving the task Blocked forever.
+        //
+        // yield_now avoids nested block_on entirely while still allowing
+        // other tasks to run during slow SDHCI operations.
+        for _ in 0..100_000 {
             if let Some(r) = self.try_take(take) {
-                return Poll::Ready(r);
+                return r;
             }
-            Poll::Pending
-        }))
+            axtask::yield_now();
+        }
+        log::error!("[SDHCI] wait_irq_flag timeout");
+        Err(SdioError::Timeout)
     }
 
     fn wait_cmd_complete(&self) -> Result<u32, SdioError> {
@@ -154,7 +187,7 @@ impl CviSdhci {
         }
     }
 
-    /// SD 命令  
+    /// SD 命令
     fn send_cmd(&self, cmd_idx: u8, arg: u32) -> Result<u32, SdioError> {
         self.wait_cmd_idle()?;
         irq::drain_flags();
@@ -454,128 +487,133 @@ impl CviSdhci {
         self.set_clock(400_000)
     }
 
-    /// 使能中断状态位（轮询模式，不产生硬件中断信号）
-    fn enable_interrupts(&self) -> Result<(), SdioError> {
+    /// 使能中断状态位 + 信号（IRQ 驱动模式）
+    fn enable_interrupts_irq(&self) -> Result<(), SdioError> {
+        irq::irq_state_init(self.base);
         self.write::<u16>(SDHCI_NORM_INT_STS_EN, NORM_INT_ENABLE_MASK);
         self.write::<u16>(SDHCI_ERR_INT_STS_EN, ERR_INT_ENABLE_MASK);
+        // IRQ 驱动模式: 使能硬件中断信号
         irq::enable_irq_signals();
-        Ok(())
-    }
-
-    /// CMD5 探测 SDIO 卡，返回 OCR 寄存器值
-    fn probe_card(&self) -> Result<u32, SdioError> {
-        let mut ocr = 0u32;
-        for _ in 0..CMD5_OCR_RETRY {
-            match self.send_cmd(5, ocr) {
-                Ok(resp) => {
-                    if ocr == 0 {
-                        ocr = resp & R4_OCR_MASK;
-                        continue;
-                    }
-                    if resp & R4_READY != 0 {
-                        return Ok(ocr);
-                    }
-                }
-                Err(SdioError::Timeout) if ocr == 0 => continue,
-                Err(e) => return Err(e),
-            }
-            for _ in 0..FUNC_READY_DELAY {
-                core::hint::spin_loop();
-            }
-        }
-        Err(SdioError::Timeout)
-    }
-
-    /// CMD3 + CMD7：请求 RCA 并选卡
-    fn request_rca_and_select(&mut self) -> Result<(), SdioError> {
-        let resp = self.send_cmd(3, 0)?;
-        self.rca = (resp >> 16) as u16;
-        self.send_cmd(7, (self.rca as u32) << 16)?;
-        Ok(())
-    }
-
-    /// 设置高速模式
-    fn setup_high_speed_mode(&self) -> Result<(), SdioError> {
-        let bus_speed = self.cmd52_read(0, CCCR_BUS_SPEED_SELECT)?;
-        if (bus_speed & 0x01) != 0 {
-            // 支持高速模式
-            self.cmd52_write(0, CCCR_BUS_SPEED_SELECT, bus_speed | 0x02)?;
-            let hc1 = self.read::<u8>(SDHCI_HOST_CONTROL);
-            self.write::<u8>(SDHCI_HOST_CONTROL, hc1 | HC_HIGH_SPEED);
-            self.set_clock(50_000_000)?;
-        } else {
-            // 不支持高速模式，使用默认时钟
-            self.set_clock(25_000_000)?;
-        }
-        Ok(())
-    }
-
-    /// 设置 4-bit 总线宽度
-    fn setup_bus_width(&self) -> Result<(), SdioError> {
-        let bus_if = self.cmd52_read(0, CCCR_BUS_INTERFACE)?;
-        self.cmd52_write(0, CCCR_BUS_INTERFACE, (bus_if & 0xFC) | 0x02)?;
-        let hc1 = self.read::<u8>(SDHCI_HOST_CONTROL);
-        self.write::<u8>(SDHCI_HOST_CONTROL, hc1 | HC_BUS_WIDTH_4);
-        Ok(())
-    }
-
-    /// 使能 Function 1 并设置块大小
-    fn setup_function(&self) -> Result<(), SdioError> {
-        self.enable_func(1)?;
-        self.set_block_size(1, SDIO_DEFAULT_BLOCK_SIZE as u16)
-    }
-
-    /// 读取并保存卡片 vendor/device ID
-    fn read_card_info(&mut self) -> Result<(), SdioError> {
-        let (vid, did) = self
-            .read_manfid_from_cis(1)
-            .or_else(|_| self.read_manfid_from_cis(0))?;
-        self.vendor_id = vid;
-        self.device_id = did;
-        log::info!("SDIO card: vendor=0x{:04x}, device=0x{:04x}", vid, did);
         Ok(())
     }
 }
 
 impl SdioHost for CviSdhci {
     fn init(&mut self) -> Result<(), SdioError> {
-        // Step 1: SoC 级硬件初始化（如果需要）
-        // self.soc_hw_init()?;
+        const OCR_IO_FUNC_SHIFT: u32 = 28;
+        const OCR_IO_FUNC_MASK: u32 = 0x7 << OCR_IO_FUNC_SHIFT;
 
-        // Step 2: SDHCI 控制器软件复位
+        log::info!("[SDIO] Starting SDHCI init, base=0x{:x}", self.base);
+
+        // Step 1: SDHCI 控制器软件复位
         self.controller_reset()?;
+        log::debug!("[SDIO] Controller reset done");
 
-        // Step 3: 设置卡检测覆写（WiFi 模块无物理 CD 引脚）
+        // Step 2: 设置卡检测覆写（WiFi 模块无物理 CD 引脚）
         self.setup_card_detect()?;
+        log::debug!("[SDIO] Card detect override set");
 
-        // Step 4: 上电 3.3V
+        // Step 3: 上电 3.3V
         self.power_on()?;
+        log::debug!("[SDIO] Power on 3.3V");
 
-        // Step 5: 设置初始低速时钟 400KHz
+        // Step 4: 设置初始低速时钟 400KHz
         self.setup_initial_clock()?;
+        log::debug!("[SDIO] Initial clock 400KHz set");
 
-        // Step 6: 使能中断状态位
-        self.enable_interrupts()?;
+        // Step 5: 使能中断状态位 + 信号（IRQ 驱动模式）
+        // PLIC ISR 已在 aic8800_wireless::connect() 中注册
+        self.enable_interrupts_irq()?;
+        log::debug!("[SDIO] Interrupts enabled (IRQ-driven mode)");
 
-        // Step 7: CMD5 探测 SDIO 卡
-        let _ocr = self.probe_card()?;
+        // Step 6: CMD5 探测 SDIO 卡
+        let ocr_query = self.send_cmd(5, 0x0000_0000).map_err(|e| {
+            log::warn!("[SDIO] CMD5 failed: no SDIO card detected");
+            e
+        })?;
+        let num_io_funcs = ((ocr_query & OCR_IO_FUNC_MASK) >> OCR_IO_FUNC_SHIFT) as u8;
+        log::info!(
+            "[SDIO] CMD5: {} IO function(s), memory={}",
+            num_io_funcs,
+            (ocr_query & OCR_MEM_PRESENT) != 0
+        );
 
-        // Step 8: CMD3 + CMD7 请求 RCA 并选卡
-        self.request_rca_and_select()?;
+        // 选择电压并轮询直到就绪
+        let voltage = ocr_query & OCR_VOLTAGE_MASK & OCR_3V2_3V4;
+        if voltage == 0 {
+            log::error!("[SDIO] No common voltage range");
+            return Err(SdioError::Unsupported);
+        }
+        let mut ready = false;
+        for _ in 0..CMD5_OCR_RETRY {
+            let resp = self.send_cmd(5, voltage)?;
+            if resp & R4_READY != 0 {
+                ready = true;
+                break;
+            }
+            for _ in 0..1000 { core::hint::spin_loop(); }
+        }
+        if !ready {
+            log::error!("[SDIO] Card not ready after CMD5 polling");
+            return Err(SdioError::Timeout);
+        }
+        log::info!("[SDIO] Card ready (IORDY)");
 
-        // Step 9: 设置高速模式
-        self.setup_high_speed_mode()?;
+        // Step 7: CMD3 获取 RCA
+        let resp = self.send_cmd(3, 0)?;
+        self.rca = (resp >> 16) as u16;
+        log::debug!("[SDIO] RCA = 0x{:04x}", self.rca);
 
-        // Step 10: 设置 4-bit 总线宽度
-        self.setup_bus_width()?;
+        // Step 8: CMD7 选卡
+        self.send_cmd(7, (self.rca as u32) << 16)?;
+        log::debug!("[SDIO] Card selected (CMD7)");
+
+        // Step 9: 高速模式
+        let bus_speed = self.cmd52_read(0, CCCR_BUS_SPEED_SELECT)?;
+        if (bus_speed & 0x01) != 0 {
+            self.cmd52_write(0, CCCR_BUS_SPEED_SELECT, bus_speed | 0x02)?;
+            let hc1 = self.read::<u8>(SDHCI_HOST_CONTROL);
+            self.write::<u8>(SDHCI_HOST_CONTROL, hc1 | HC_HIGH_SPEED);
+            self.set_clock(50_000_000)?;
+            log::info!("[SDIO] High-Speed 50MHz enabled");
+        } else {
+            self.set_clock(25_000_000)?;
+            log::info!("[SDIO] Default Speed 25MHz");
+        }
+
+        // 诊断：检查 SIG_EN 寄存器是否仍有效
+        let sig_norm = self.read::<u16>(SDHCI_NORM_INT_SIG_EN);
+        let sig_err = self.read::<u16>(SDHCI_ERR_INT_SIG_EN);
+        let int_norm = self.read::<u16>(SDHCI_INT_STATUS_NORM);
+        log::info!("[SDIO] DIAG: SIG_NORM=0x{:04x}, SIG_ERR=0x{:04x}, INT_NORM=0x{:04x}", sig_norm, sig_err, int_norm);
+
+        // Step 10: 4-bit 总线宽度
+        log::info!("[SDIO] Setting up 4-bit bus width...");
+        let bus_if = self.cmd52_read(0, CCCR_BUS_INTERFACE)?;
+        self.cmd52_write(0, CCCR_BUS_INTERFACE, (bus_if & 0xFC) | 0x02)?;
+        let hc1 = self.read::<u8>(SDHCI_HOST_CONTROL);
+        self.write::<u8>(SDHCI_HOST_CONTROL, hc1 | HC_BUS_WIDTH_4);
+        log::info!("[SDIO] 4-bit bus mode enabled");
 
         // Step 11: 使能 Function 1 并设置块大小
-        self.setup_function()?;
+        self.enable_func(1)?;
+        self.set_block_size(1, SDIO_DEFAULT_BLOCK_SIZE as u16)?;
+        log::info!("[SDIO] Function 1 enabled, block size = {}", SDIO_DEFAULT_BLOCK_SIZE);
 
-        // Step 12: 读取并保存卡片信息
-        self.read_card_info()?;
+        // Step 12: 读取 vendor/device ID
+        let (vid, did) = self.read_manfid_from_cis(1)
+            .or_else(|_| self.read_manfid_from_cis(0))?;
+        self.vendor_id = vid;
+        self.device_id = did;
+        log::info!("[SDIO] card: vendor=0x{:04x}, device=0x{:04x}", vid, did);
 
+        log::info!("[SDIO] SDHCI init complete");
         Ok(())
+    }
+
+    /// 获取 MMIO 基地址（ISR 等需要直接访问寄存器的场景）
+    fn mmio_base(&self) -> usize {
+        self.base
     }
 
     fn read_byte(&self, func: u8, addr: u32) -> Result<u8, SdioError> {
@@ -746,11 +784,15 @@ impl SdioHost for CviSdhci {
         (self.vendor_id, self.device_id)
     }
 
-    fn mask_card_irq(&self) {
-        mask_card_irq_raw(self.base, true);
+    fn enable_irq(&self) {
+        irq::enable_irq_signals();
     }
 
-    fn unmask_card_irq(&self) {
-        mask_card_irq_raw(self.base, false);
+    fn disable_irq(&self) {
+        irq::disable_irq_signals();
+    }
+
+    fn card_irq_ctrl(&self) -> Option<Arc<dyn SdioCardIrq>> {
+        Some(Arc::new(CviCardIrqCtrl::new(self.base))) 
     }
 }
