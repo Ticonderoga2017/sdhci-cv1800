@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-axdriver_sdio = { git = "https://github.com/Ticonderoga2017/axdriver_sdio.git" }
-axtask = { git = "https://github.com/Ticonderoga2017/sg2002-arceos.git", package = "axtask", features = ["multitask"] }
+axdriver_sdio = { path = "../axdriver_sdio" }
+axtask = { path = "../../StarryOS/arceos/modules/axtask", features = ["multitask"] }
 axpoll = "0.1"
 log = "0.4"
